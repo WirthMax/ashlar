@@ -78,6 +78,27 @@ def main(argv=sys.argv):
               ' of SIGMA pixels (default: no filtering)'),
     )
     parser.add_argument(
+        '--position-method', choices=['mst', 'global'], default='mst',
+        metavar='METHOD',
+        help='Method for deriving global tile positions from pairwise'
+        ' alignments during stitching: mst builds a minimum spanning tree and'
+        ' accumulates shifts along it; global solves a weighted least-squares'
+        ' fit over all surviving edges, distributing error instead of'
+        ' accumulating it',
+    )
+    parser.add_argument(
+        '--position-weight', choices=['inv-encc', 'ncc', 'uniform'],
+        default='inv-encc', metavar='WEIGHT',
+        help='Edge weighting for the global position solver (only used when'
+        ' --position-method=global)',
+    )
+    parser.add_argument(
+        '--anchor-lambda', type=float, default=0, metavar='LAMBDA',
+        help='Tikhonov anchor strength biasing global-solver positions toward'
+        ' recorded stage positions (only used when --position-method=global;'
+        ' keep small)',
+    )
+    parser.add_argument(
         '-f', '--filename-format', dest='filename_format',
         default='cycle_{cycle}_channel_{channel}.tif', help=argparse.SUPPRESS,
     )
@@ -203,6 +224,9 @@ def main(argv=sys.argv):
     aligner_args["alpha"] = args.stitch_alpha
     aligner_args["max_error"] = args.maximum_error
     aligner_args['filter_sigma'] = args.filter_sigma
+    aligner_args['position_method'] = args.position_method
+    aligner_args['position_weight'] = args.position_weight
+    aligner_args['anchor_lambda'] = args.anchor_lambda
 
     mosaic_args = {}
     if args.output_channels:
@@ -254,7 +278,10 @@ def process_single(
     reader = build_reader(filepaths[0], barrel_correction, plate_well=plate_well)
     process_axis_flip(reader, flip_x, flip_y)
     ea_args = aligner_args.copy()
-    for arg in ("alpha", "max_error"):
+    for arg in (
+        "alpha", "max_error", "position_method", "position_weight",
+        "anchor_lambda",
+    ):
         aligner_args.pop(arg, None)
     if len(filepaths) == 1:
         ea_args['do_make_thumbnail'] = False

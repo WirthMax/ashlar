@@ -7,6 +7,8 @@ import jnius_config
 import numpy as np
 import scipy.spatial.distance
 import scipy.fft
+import scipy.sparse
+import scipy.sparse.linalg
 import skimage.util
 import skimage.util.dtype
 import skimage.io
@@ -496,7 +498,9 @@ class EdgeAligner(object):
 
     def __init__(
         self, reader, channel=0, max_shift=15, alpha=0.01, max_error=None,
-        randomize=False, filter_sigma=0.0, do_make_thumbnail=True, verbose=False
+        randomize=False, filter_sigma=0.0, do_make_thumbnail=True,
+        position_method="mst", position_weight="inv-encc", anchor_lambda=0.0,
+        verbose=False
     ):
         self.channel = channel
         self.reader = CachingReader(reader, self.channel)
@@ -509,6 +513,19 @@ class EdgeAligner(object):
         self.randomize = randomize
         self.filter_sigma = filter_sigma
         self.do_make_thumbnail = do_make_thumbnail
+        if position_method not in ("mst", "global"):
+            raise ValueError(
+                "position_method must be 'mst' or 'global', got %r"
+                % position_method
+            )
+        if position_weight not in ("inv-encc", "ncc", "uniform"):
+            raise ValueError(
+                "position_weight must be 'inv-encc', 'ncc' or 'uniform', got %r"
+                % position_weight
+            )
+        self.position_method = position_method
+        self.position_weight = position_weight
+        self.anchor_lambda = anchor_lambda
         self._cache = {}
         self.errors_negative_sampled = np.empty(0)
 
@@ -520,7 +537,10 @@ class EdgeAligner(object):
         self.compute_threshold()
         self.register_all()
         self.build_spanning_tree()
-        self.calculate_positions()
+        if self.position_method == "global":
+            self.calculate_positions_global()
+        else:
+            self.calculate_positions()
         self.fit_model()
 
     def make_thumbnail(self):
@@ -679,6 +699,150 @@ class EdgeAligner(object):
         else:
             # TODO: fill in shifts and positions with 0x2 arrays
             raise NotImplementedError("No images")
+
+    def calculate_positions_global(self):
+        """Compute tile positions with a weighted global least-squares solve.
+
+        This is an alternative to :meth:`calculate_positions` (spanning-tree
+        accumulation). It uses the identical pruned (finite-error) edge set and
+        the identical cached pairwise shifts, but instead of keeping only a
+        spanning tree and summing shifts along it, it solves for all tile
+        corrective shifts simultaneously. Redundant edges then act as loop-
+        closure constraints and residual error is distributed across edges
+        rather than accumulated along tree paths (where it grows ~sqrt(path
+        length)).
+
+        Like :meth:`calculate_positions`, this works in "shift space": it solves
+        for the corrective shift ``s_i`` of each tile relative to its nominal
+        stage position, with per-edge constraint ``s_j - s_i = c_ij`` (``c_ij``
+        the cached pairwise shift), and sets ``positions = metadata.positions +
+        shifts``. For a component that is already a tree the solve reduces to the
+        accumulation result up to the shared gauge.
+        """
+        # Pruned graph: the same finite-error edges build_spanning_tree uses.
+        g = nx.Graph()
+        g.add_nodes_from(self.neighbors_graph)
+        g.add_edges_from(
+            (t1, t2)
+            for (t1, t2), (_, error) in self._cache.items()
+            if np.isfinite(error)
+        )
+        num_tiles = self.metadata.num_images
+        shifts = np.zeros((num_tiles, 2))
+        any_node = False
+        for component in nx.connected_components(g):
+            any_node = True
+            nodes = sorted(component)
+            edges = list(g.subgraph(nodes).edges)
+            if not edges:
+                # Isolated tile: leave its shift at 0. Its absolute placement is
+                # handled by the affine fallback in fit_model, exactly as for the
+                # edgeless components in the spanning-tree path.
+                continue
+            shifts[nodes] = self._solve_component_positions(nodes, edges)
+        if not any_node:
+            raise NotImplementedError("No images")
+        self.shifts = shifts
+        self.positions = self.metadata.positions + self.shifts
+
+    def _solve_component_positions(self, nodes, edges):
+        """Solve the weighted least-squares position problem for one component.
+
+        Minimizes, independently for the x and y axes,
+
+            sum over edges (i, j) of   w_ij * || s_j - s_i - c_ij ||^2
+
+        where ``s_i`` is the corrective shift of tile ``i``, ``c_ij`` is the
+        cached pairwise shift, and ``w_ij`` is the edge weight. With ``A`` the
+        signed edge-node incidence matrix and ``W = diag(w_ij)``, the normal
+        equations are
+
+            L s = A^T W c,   L = A^T W A   (weighted graph Laplacian).
+
+        ``L`` is sparse, symmetric and positive-semidefinite with a one-
+        dimensional null space (a free global translation for the component).
+        The gauge is fixed by pinning the tile with the largest total incident
+        weight to ``s = 0`` -- equivalent to fixing it to its nominal stage
+        position and mirroring the spanning-tree root, introducing no bias toward
+        stage positions -- then dropping its row/column and solving the reduced
+        SPD system. The optional Tikhonov term ``+ anchor_lambda * sum_i
+        ||s_i||^2`` gives ``(L + lambda I) s = A^T W c`` (the nominal shift is 0,
+        so the right-hand side is unchanged); it aids conditioning and gently
+        places weakly-connected tiles but biases the result back toward raw stage
+        positions if made large, so keep it small.
+
+        Returns an ``(len(nodes), 2)`` array of shifts, ordered to match
+        ``nodes``.
+        """
+        index = {t: i for i, t in enumerate(nodes)}
+        n = len(nodes)
+        edges = [tuple(sorted(e)) for e in edges]
+        ne = len(edges)
+        rows = np.repeat(np.arange(ne), 2)
+        cols = np.empty(2 * ne, dtype=int)
+        vals = np.empty(2 * ne)
+        c = np.zeros((ne, 2))
+        weights = np.empty(ne)
+        incident = np.zeros(n)
+        for e, (t1, t2) in enumerate(edges):
+            # t1 < t2, so the cached shift already has the (t1 -> t2)
+            # orientation and the constraint is s_j - s_i = c_ij.
+            shift, error = self._cache[(t1, t2)]
+            i, j = index[t1], index[t2]
+            cols[2 * e] = i
+            cols[2 * e + 1] = j
+            vals[2 * e] = -1.0
+            vals[2 * e + 1] = 1.0
+            c[e] = shift
+            w = self._edge_weight(error)
+            weights[e] = w
+            incident[i] += w
+            incident[j] += w
+        A = scipy.sparse.csr_matrix((vals, (rows, cols)), shape=(ne, n))
+        W = scipy.sparse.diags(weights)
+        L = (A.T @ W @ A).tocsr()
+        rhs = A.T @ (weights[:, None] * c)
+        sol = np.zeros((n, 2))
+        if self.anchor_lambda:
+            L = L + self.anchor_lambda * scipy.sparse.identity(n, format="csr")
+            for axis in range(2):
+                sol[:, axis] = self._spsolve(L, rhs[:, axis])
+        else:
+            pin = int(np.argmax(incident))
+            keep = np.flatnonzero(np.arange(n) != pin)
+            L_red = L[keep][:, keep]
+            rhs_red = rhs[keep]
+            for axis in range(2):
+                sol[keep, axis] = self._spsolve(L_red, rhs_red[:, axis])
+            # The pinned tile keeps shift 0.
+        return sol
+
+    def _edge_weight(self, error):
+        """Map a stored per-edge error to a least-squares edge weight.
+
+        The cached ``error`` is ``utils.nccw`` = ``-log(NCC)``: non-negative,
+        lower meaning more confident. ``inv-encc`` (default) weights by
+        ``1 / max(error, eps)``; ``ncc`` recovers the normalized cross-
+        correlation ``exp(-error)``; ``uniform`` weights every edge equally.
+        Inverse measurement variance is the principled ideal weight; ENCC and
+        NCC are practical proxies for it.
+        """
+        eps = 1e-9
+        if self.position_weight == "uniform":
+            return 1.0
+        elif self.position_weight == "ncc":
+            return float(np.exp(-error))
+        else:  # inv-encc
+            return 1.0 / max(error, eps)
+
+    @staticmethod
+    def _spsolve(L, b):
+        # Direct sparse solve is reliable for typical component sizes; fall back
+        # to conjugate gradient for very large components.
+        L = scipy.sparse.csc_matrix(L)
+        if L.shape[0] > 5000:
+            return scipy.sparse.linalg.cg(L, b)[0]
+        return scipy.sparse.linalg.spsolve(L, b)
 
     def fit_model(self):
         components = sorted(
