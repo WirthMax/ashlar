@@ -23,6 +23,7 @@ import matplotlib.patches as mpatches
 import matplotlib.patheffects as mpatheffects
 import zarr
 from . import utils
+from . import lsq
 from . import thumbnail
 from . import transform
 from . import __version__ as _version
@@ -500,7 +501,7 @@ class EdgeAligner(object):
         self, reader, channel=0, max_shift=15, alpha=0.01, max_error=None,
         randomize=False, filter_sigma=0.0, do_make_thumbnail=True,
         position_method="mst", position_weight="inv-encc", anchor_lambda=0.0,
-        verbose=False
+        robust=False, verbose=False
     ):
         self.channel = channel
         self.reader = CachingReader(reader, self.channel)
@@ -526,6 +527,7 @@ class EdgeAligner(object):
         self.position_method = position_method
         self.position_weight = position_weight
         self.anchor_lambda = anchor_lambda
+        self.robust = robust
         self._cache = {}
         self.errors_negative_sampled = np.empty(0)
 
@@ -771,6 +773,17 @@ class EdgeAligner(object):
         places weakly-connected tiles but biases the result back toward raw stage
         positions if made large, so keep it small.
 
+        When ``self.robust`` is set, the solve is made robust (Huber IRLS on
+        leverage-corrected residuals) by :func:`ashlar.lsq.solve_weighted_lsq`,
+        limiting the influence of a single bad-but-confident edge. Because
+        residuals are ~0 on a consistent (e.g. tree) component, the robust
+        factors stay 1 there and the result matches the non-robust solve.
+
+        The actual linear algebra lives in :func:`ashlar.lsq.solve_weighted_lsq`;
+        this method only assembles the incidence matrix, shifts and weights for
+        one component and chooses the gauge (pin the most-connected tile, or a
+        Tikhonov ridge when ``anchor_lambda`` is set).
+
         Returns an ``(len(nodes), 2)`` array of shifts, ordered to match
         ``nodes``.
         """
@@ -782,7 +795,7 @@ class EdgeAligner(object):
         cols = np.empty(2 * ne, dtype=int)
         vals = np.empty(2 * ne)
         c = np.zeros((ne, 2))
-        weights = np.empty(ne)
+        base_weights = np.empty(ne)
         incident = np.zeros(n)
         for e, (t1, t2) in enumerate(edges):
             # t1 < t2, so the cached shift already has the (t1 -> t2)
@@ -795,54 +808,25 @@ class EdgeAligner(object):
             vals[2 * e + 1] = 1.0
             c[e] = shift
             w = self._edge_weight(error)
-            weights[e] = w
+            base_weights[e] = w
             incident[i] += w
             incident[j] += w
         A = scipy.sparse.csr_matrix((vals, (rows, cols)), shape=(ne, n))
-        W = scipy.sparse.diags(weights)
-        L = (A.T @ W @ A).tocsr()
-        rhs = A.T @ (weights[:, None] * c)
-        sol = np.zeros((n, 2))
-        if self.anchor_lambda:
-            L = L + self.anchor_lambda * scipy.sparse.identity(n, format="csr")
-            for axis in range(2):
-                sol[:, axis] = self._spsolve(L, rhs[:, axis])
-        else:
-            pin = int(np.argmax(incident))
-            keep = np.flatnonzero(np.arange(n) != pin)
-            L_red = L[keep][:, keep]
-            rhs_red = rhs[keep]
-            for axis in range(2):
-                sol[keep, axis] = self._spsolve(L_red, rhs_red[:, axis])
-            # The pinned tile keeps shift 0.
-        return sol
+        # Pin the most-connected tile (gauge), unless a Tikhonov ridge is used.
+        pin = int(np.argmax(incident))
+        return lsq.solve_weighted_lsq(
+            A, c, base_weights,
+            pin=(None if self.anchor_lambda else pin),
+            ridge=self.anchor_lambda,
+            robust=self.robust,
+        )
 
     def _edge_weight(self, error):
         """Map a stored per-edge error to a least-squares edge weight.
 
-        The cached ``error`` is ``utils.nccw`` = ``-log(NCC)``: non-negative,
-        lower meaning more confident. ``inv-encc`` (default) weights by
-        ``1 / max(error, eps)``; ``ncc`` recovers the normalized cross-
-        correlation ``exp(-error)``; ``uniform`` weights every edge equally.
-        Inverse measurement variance is the principled ideal weight; ENCC and
-        NCC are practical proxies for it.
+        See :func:`ashlar.lsq.confidence_weight`.
         """
-        eps = 1e-9
-        if self.position_weight == "uniform":
-            return 1.0
-        elif self.position_weight == "ncc":
-            return float(np.exp(-error))
-        else:  # inv-encc
-            return 1.0 / max(error, eps)
-
-    @staticmethod
-    def _spsolve(L, b):
-        # Direct sparse solve is reliable for typical component sizes; fall back
-        # to conjugate gradient for very large components.
-        L = scipy.sparse.csc_matrix(L)
-        if L.shape[0] > 5000:
-            return scipy.sparse.linalg.cg(L, b)[0]
-        return scipy.sparse.linalg.spsolve(L, b)
+        return lsq.confidence_weight(error, self.position_weight)
 
     def fit_model(self):
         components = sorted(
@@ -1001,7 +985,8 @@ class EdgeAligner(object):
 class LayerAligner(object):
 
     def __init__(self, reader, reference_aligner, channel=None, max_shift=15,
-                 filter_sigma=0.0, verbose=False):
+                 filter_sigma=0.0, position_method="anchor",
+                 position_weight="inv-encc", robust=False, verbose=False):
         self.reader = reader
         self.reference_aligner = reference_aligner
         if channel is None:
@@ -1011,6 +996,19 @@ class LayerAligner(object):
         self.max_shift = max_shift
         self.max_shift_pixels = self.max_shift / self.metadata.pixel_size
         self.filter_sigma = filter_sigma
+        if position_method not in ("anchor", "joint"):
+            raise ValueError(
+                "position_method must be 'anchor' or 'joint', got %r"
+                % position_method
+            )
+        if position_weight not in ("inv-encc", "ncc", "uniform"):
+            raise ValueError(
+                "position_weight must be 'inv-encc', 'ncc' or 'uniform', got %r"
+                % position_weight
+            )
+        self.position_method = position_method
+        self.position_weight = position_weight
+        self.robust = robust
         self.verbose = verbose
         # FIXME Still a bit muddled here on the use of metadata positions vs.
         # corrected positions from the reference aligner. We probably want to
@@ -1024,7 +1022,10 @@ class LayerAligner(object):
         self.make_thumbnail()
         self.coarse_align()
         self.register_all()
-        self.calculate_positions()
+        if self.position_method == "joint":
+            self.calculate_positions_joint()
+        else:
+            self.calculate_positions()
 
     def make_thumbnail(self):
         self.reader.thumbnail = thumbnail.make_thumbnail(
@@ -1108,6 +1109,142 @@ class LayerAligner(object):
             self.offset = np.nan_to_num(np.mean(self.shifts[~discard], axis=0))
         # Fill in discarded shifts from the predictions.
         self.positions[discard] = predictions[discard] + self.offset
+
+    def calculate_positions_joint(self):
+        """Place this cycle's tiles with a joint anchor + overlap solve.
+
+        The default (anchor) method registers every tile independently against
+        the reference cycle and falls back to an affine prediction whenever that
+        single registration fails -- a failed tile gets no help from its
+        well-registered neighbors. This method instead solves, per connected
+        component and independently for x and y,
+
+            min  sum_i w_a,i ||p_i - a_i||^2  +  sum_(i,j) w_o,ij ||p_j - p_i - d_ij||^2
+
+        where ``a_i`` is the per-tile anchor target (the position the anchor
+        method computes before ``constrain_positions``) and ``d_ij`` are the
+        moving cycle's own intra-cycle overlap displacements. The anchor terms
+        fix the absolute reference frame; a tile whose anchor failed is carried
+        into place by its neighbors' overlaps plus their good anchors. Each
+        cycle is still solved independently against the reference, so failures
+        stay isolated between cycles (this is not joint bundle adjustment).
+        """
+        n = self.metadata.num_images
+        coef = self.reference_aligner.lr.coef_
+        # Anchor targets: identical to the anchor method's pre-constrain result.
+        anchor_pos = (
+            self.corrected_nominal_positions
+            + self.shifts
+            + self.reference_aligner_positions
+            - self.reference_positions
+        )
+        valid = ~self._anchor_discard_mask(anchor_pos)
+        anchor_w = np.where(
+            valid,
+            [lsq.confidence_weight(e, self.position_weight) for e in self.errors],
+            0.0,
+        )
+        # Intra-cycle overlaps, measured on this cycle's own images.
+        overlaps = self._measure_intra_overlaps()
+        graph = nx.Graph()
+        graph.add_nodes_from(range(n))
+        graph.add_edges_from((t1, t2) for t1, t2, _, _ in overlaps)
+        overlap_cache = {(t1, t2): (c, err) for t1, t2, c, err in overlaps}
+        # Affine predictions (+ global offset) for tiles with no usable anchor.
+        predictions = self.reference_aligner.lr.predict(
+            self.corrected_nominal_positions
+        )
+        offset = (
+            np.nan_to_num(np.median(self.shifts[valid], axis=0))
+            if valid.any() else np.zeros(2)
+        )
+
+        self.positions = np.empty((n, 2))
+        for component in nx.connected_components(graph):
+            nodes = sorted(component)
+            if not anchor_w[nodes].any():
+                # No absolute reference in this component: fall back to the
+                # affine model prediction, exactly as constrain_positions does.
+                self.positions[nodes] = predictions[nodes] + offset
+                continue
+            edges = list(graph.subgraph(nodes).edges)
+            self.positions[nodes] = self._solve_component_joint(
+                nodes, edges, anchor_pos, anchor_w, overlap_cache, coef
+            )
+        self.centers = self.positions + self.metadata.size / 2
+
+    def _anchor_discard_mask(self, positions):
+        """Boolean mask of tiles whose cross-cycle anchor is unusable.
+
+        Reuses ``constrain_positions``'s hard-failure criteria: a registration
+        that locked onto the sensor dark-current pattern (the corrected position
+        equals the reference position to subpixel precision) or that returned an
+        infinite error. Soft outliers are left for the robust solve to handle.
+        """
+        position_diffs = np.absolute(positions - self.reference_aligner_positions)
+        position_diffs = np.rint(position_diffs * 10) / 10
+        discard = (position_diffs == 0).all(axis=1)
+        discard |= np.isinf(self.errors)
+        return discard
+
+    def _measure_intra_overlaps(self):
+        """Measure this cycle's intra-cycle tile overlaps.
+
+        Reuses ``EdgeAligner``'s alignment + pruning machinery on this cycle's
+        own reader, returning ``(t1, t2, shift, error)`` for each surviving
+        (finite-error) overlap edge. The spanning tree / position steps are not
+        run -- only the cached pairwise measurements are needed.
+        """
+        ea = EdgeAligner(
+            self.reader, channel=self.channel, max_shift=self.max_shift,
+            filter_sigma=self.filter_sigma, do_make_thumbnail=False,
+            randomize=False, verbose=self.verbose,
+        )
+        ea.check_overlaps()
+        ea.compute_threshold()
+        ea.register_all()
+        return [
+            (t1, t2, np.asarray(shift, dtype=float), error)
+            for (t1, t2), (shift, error) in ea._cache.items()
+            if np.isfinite(error)
+        ]
+
+    def _solve_component_joint(self, nodes, edges, anchor_pos, anchor_w,
+                               overlap_cache, coef):
+        """Joint anchor + overlap least-squares solve for one component."""
+        index = {t: i for i, t in enumerate(nodes)}
+        n = len(nodes)
+        rows, cols, vals, b, weights = [], [], [], [], []
+        r = 0
+        meta_pos = self.metadata.positions
+        for edge in edges:
+            t1, t2 = sorted(edge)
+            c_ij, error = overlap_cache[(t1, t2)]
+            # Relative displacement t1 -> t2 in the reference (corrected) frame.
+            d = coef @ ((meta_pos[t2] - meta_pos[t1]) + c_ij)
+            rows += [r, r]
+            cols += [index[t1], index[t2]]
+            vals += [-1.0, 1.0]
+            b.append(d)
+            weights.append(lsq.confidence_weight(error, self.position_weight))
+            r += 1
+        for t in nodes:
+            if anchor_w[t] > 0:
+                rows.append(r)
+                cols.append(index[t])
+                vals.append(1.0)
+                b.append(anchor_pos[t])
+                weights.append(anchor_w[t])
+                r += 1
+        A = scipy.sparse.csr_matrix(
+            (vals, (rows, cols)), shape=(r, n)
+        )
+        b = np.array(b)
+        weights = np.array(weights)
+        # The anchor rows fix the gauge, so no pin/ridge is needed.
+        return lsq.solve_weighted_lsq(
+            A, b, weights, pin=None, ridge=0.0, robust=self.robust
+        )
 
     def register(self, t):
         """Return relative shift between images and the alignment error."""

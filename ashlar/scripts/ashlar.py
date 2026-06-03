@@ -99,6 +99,32 @@ def main(argv=sys.argv):
         ' keep small)',
     )
     parser.add_argument(
+        '--robust', default=False, action='store_true',
+        help='Use robust (Huber) reweighting in the global position solver to'
+        ' downweight high-residual edges (only used when'
+        ' --position-method=global)',
+    )
+    parser.add_argument(
+        '--layer-method', choices=['anchor', 'joint'], default='anchor',
+        metavar='METHOD',
+        help='Method for cross-cycle registration of each non-reference cycle:'
+        ' anchor registers each tile independently against the reference cycle;'
+        ' joint additionally uses intra-cycle tile overlaps so a tile whose'
+        ' reference registration fails is placed by its neighbors. Each cycle is'
+        ' still solved independently against the reference cycle',
+    )
+    parser.add_argument(
+        '--layer-weight', choices=['inv-encc', 'ncc', 'uniform'],
+        default='inv-encc', metavar='WEIGHT',
+        help='Edge/anchor weighting for the joint cross-cycle solver (only used'
+        ' when --layer-method=joint)',
+    )
+    parser.add_argument(
+        '--layer-robust', default=False, action='store_true',
+        help='Use robust (Huber) reweighting in the joint cross-cycle solver'
+        ' (only used when --layer-method=joint)',
+    )
+    parser.add_argument(
         '-f', '--filename-format', dest='filename_format',
         default='cycle_{cycle}_channel_{channel}.tif', help=argparse.SUPPRESS,
     )
@@ -227,6 +253,10 @@ def main(argv=sys.argv):
     aligner_args['position_method'] = args.position_method
     aligner_args['position_weight'] = args.position_weight
     aligner_args['anchor_lambda'] = args.anchor_lambda
+    aligner_args['robust'] = args.robust
+    aligner_args['layer_method'] = args.layer_method
+    aligner_args['layer_weight'] = args.layer_weight
+    aligner_args['layer_robust'] = args.layer_robust
 
     mosaic_args = {}
     if args.output_channels:
@@ -264,6 +294,9 @@ def process_single(
 ):
 
     mosaic_args = mosaic_args.copy()
+    # Copy so the per-key pops below don't mutate the caller's dict (process_plates
+    # reuses the same aligner_args across wells).
+    aligner_args = dict(aligner_args)
     writer_args = {}
     if pyramid:
         writer_args["tile_size"] = mosaic_args.pop("tile_size", None)
@@ -278,11 +311,21 @@ def process_single(
     reader = build_reader(filepaths[0], barrel_correction, plate_well=plate_well)
     process_axis_flip(reader, flip_x, flip_y)
     ea_args = aligner_args.copy()
+    # EdgeAligner-only keys: drop from the LayerAligner kwargs.
     for arg in (
         "alpha", "max_error", "position_method", "position_weight",
-        "anchor_lambda",
+        "anchor_lambda", "robust",
     ):
         aligner_args.pop(arg, None)
+    # LayerAligner-only keys: drop from the EdgeAligner kwargs and remap to
+    # LayerAligner's parameter names.
+    for arg in ("layer_method", "layer_weight", "layer_robust"):
+        ea_args.pop(arg, None)
+    layer_kwargs = dict(
+        position_method=aligner_args.pop("layer_method"),
+        position_weight=aligner_args.pop("layer_weight"),
+        robust=aligner_args.pop("layer_robust"),
+    )
     if len(filepaths) == 1:
         ea_args['do_make_thumbnail'] = False
     edge_aligner = reg.EdgeAligner(reader, **ea_args)
@@ -301,7 +344,9 @@ def process_single(
             print('    reading %s' % filepath)
         reader = build_reader(filepath, barrel_correction, plate_well=plate_well)
         process_axis_flip(reader, flip_x, flip_y)
-        layer_aligner = reg.LayerAligner(reader, edge_aligner, **aligner_args)
+        layer_aligner = reg.LayerAligner(
+            reader, edge_aligner, **aligner_args, **layer_kwargs
+        )
         layer_aligner.run()
         mosaic_args_final = mosaic_args.copy()
         if ffp_paths:
