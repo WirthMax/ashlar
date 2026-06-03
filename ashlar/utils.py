@@ -199,7 +199,17 @@ def pastefunc_blend(target, img):
     # This should catch actual holes but not the actual unfilled space.
     # FIXME Should generate mask from tile boundaries instead.
     hole_threshold = np.mean(target.shape)
-    mask = skimage.morphology.remove_small_holes(target != 0, hole_threshold)
+    # scikit-image renamed `area_threshold` to `max_size` in 0.26; use whichever
+    # this version accepts so the call works (without a deprecation warning) on
+    # both old and new versions.
+    try:
+        mask = skimage.morphology.remove_small_holes(
+            target != 0, max_size=hole_threshold
+        )
+    except TypeError:  # scikit-image < 0.26 has no max_size parameter
+        mask = skimage.morphology.remove_small_holes(
+            target != 0, area_threshold=hole_threshold
+        )
     dist = scipy.ndimage.distance_transform_cdt(mask)
     dmax = dist.max()
     if dmax == 0:
@@ -212,7 +222,12 @@ def pastefunc_blend(target, img):
         # img, such as barrel correction and rotation.
         # FIXME Should compute the geometry of the source image mask more
         # deliberately and precisely.
-        alpha[skimage.morphology.binary_dilation(img == 0)] = 1
+        # `binary_dilation` is deprecated in scikit-image 0.26; `dilation` with a
+        # connectivity-1 (cross) footprint -- diamond(1), binary_dilation's
+        # default footprint -- reproduces the same 1-pixel dilation and works
+        # across versions.
+        alpha[skimage.morphology.dilation(
+            img == 0, skimage.morphology.diamond(1)).astype(bool)] = 1
     return target * alpha + img * (1 - alpha)
 
 
